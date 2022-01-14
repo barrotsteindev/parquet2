@@ -1,17 +1,17 @@
 use std::io::Write;
 
 use futures::AsyncWrite;
-use parquet_format_async_temp::{RowGroup, ColumnMetaData, ColumnChunk};
+use parquet_format_async_temp::{ColumnChunk, ColumnMetaData, RowGroup};
 
 use crate::{
     compression::Compression,
     error::{ParquetError, Result},
-    metadata::ColumnDescriptor,
+    metadata::{self, ColumnChunkMetaData, ColumnDescriptor},
     page::CompressedPage,
 };
 
 use super::{
-    column_chunk::{write_column_chunk, write_column_chunk_async},
+    column_chunk::{self, write_column_chunk, write_column_chunk_async},
     DynIter, DynStreamingIterator,
 };
 
@@ -27,15 +27,39 @@ fn same_elements<T: PartialEq + Copy>(arr: &[T]) -> Option<Option<T>> {
     }
 }
 
-fn calc_row_group_file_offset(columns: &Vec<ColumnChunk>) -> Option<i64> {
-    match columns.len() {
-        0 => None,
-        _ => {
-            let metadata: &ColumnMetaData = columns[0].meta_data.as_ref().unwrap();
-            Some(metadata.dictionary_page_offset
-                .filter(|x| *x > 0_i64)
-                .unwrap_or(metadata.data_page_offset))
+pub struct ColumnOffsetsMetadata {
+    pub dictionary_page_offset: Option<i64>,
+    pub data_page_offset: Option<i64>,
+}
+
+impl ColumnOffsetsMetadata {
+    pub fn from_column_chunk(column_chunk: &ColumnChunk) -> ColumnOffsetsMetadata {
+        ColumnOffsetsMetadata {
+            dictionary_page_offset: column_chunk
+                .meta_data
+                .as_ref()
+                .map(|meta| meta.dictionary_page_offset)
+                .unwrap_or(None),
+            data_page_offset: column_chunk
+                .meta_data
+                .as_ref()
+                .map(|meta| meta.data_page_offset),
         }
+    }
+
+    pub fn from_column_chunk_metadata(
+        column_chunk_metadata: &ColumnChunkMetaData,
+    ) -> ColumnOffsetsMetadata {
+        ColumnOffsetsMetadata {
+            dictionary_page_offset: column_chunk_metadata.dictionary_page_offset(),
+            data_page_offset: Some(column_chunk_metadata.data_page_offset()),
+        }
+    }
+
+    pub fn calc_row_group_file_offset(&self) -> Option<i64> {
+        self.dictionary_page_offset
+            .filter(|x| *x > 0_i64)
+            .or(self.data_page_offset)
     }
 }
 
@@ -79,7 +103,13 @@ where
         Some(Some(v)) => v
     };
 
-    let file_offest = calc_row_group_file_offset(&columns);
+    let file_offest = columns
+        .iter()
+        .next()
+        .map(|column_chunk| {
+            ColumnOffsetsMetadata::from_column_chunk(column_chunk).calc_row_group_file_offset()
+        })
+        .unwrap_or(None);
 
     let total_byte_size = columns
         .iter()
@@ -139,8 +169,13 @@ where
         Some(Some(v)) => v
     };
 
-    // compute row group file offset
-    let file_offest = calc_row_group_file_offset(&columns);
+    let file_offest = columns
+        .iter()
+        .next()
+        .map(|column_chunk| {
+            ColumnOffsetsMetadata::from_column_chunk(column_chunk).calc_row_group_file_offset()
+        })
+        .unwrap_or(None);
 
     let total_byte_size = columns
         .iter()
